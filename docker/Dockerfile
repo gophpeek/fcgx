@@ -8,7 +8,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure PHP-FPM
-RUN sed -i '/^listen =/d' /usr/local/etc/php-fpm.d/www.conf \
+RUN sed -i '/^listen =/c\listen = 0.0.0.0:9000' /usr/local/etc/php-fpm.d/www.conf \
     && sed -i '/^clear_env *=/c\clear_env = no' /usr/local/etc/php-fpm.d/www.conf \
     && sed -i '/^listen.allowed_clients *=/c\listen.allowed_clients = 127.0.0.1' /usr/local/etc/php-fpm.d/www.conf \
     && sed -i '/^php_admin_value\[error_log\] *=/c\php_admin_value[error_log] = /proc/self/fd/2' /usr/local/etc/php-fpm.d/www.conf \
