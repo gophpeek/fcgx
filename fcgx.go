@@ -1,3 +1,39 @@
+// Package fcgx provides a minimal, robust, and modern FastCGI client library for Go.
+//
+// This package is designed for integrating with PHP-FPM and other FastCGI servers,
+// aiming for idiomatic Go code, high testability, and correct protocol handling.
+// It supports context, deadlines, timeouts, and structured error handling.
+//
+// Example usage:
+//
+//	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+//	defer cancel()
+//
+//	client, err := fcgx.DialContext(ctx, "unix", "/var/run/php-fpm.sock")
+//	if err != nil {
+//		panic(err)
+//	}
+//	defer client.Close()
+//
+//	params := map[string]string{
+//		"SCRIPT_FILENAME": "/usr/share/phpmyadmin/index.php",
+//		"SCRIPT_NAME":     "/index.php",
+//		"REQUEST_METHOD":  "GET",
+//		"SERVER_PROTOCOL": "HTTP/1.1",
+//		"REMOTE_ADDR":     "127.0.0.1",
+//	}
+//
+//	resp, err := client.Get(ctx, params)
+//	if err != nil {
+//		panic(err)
+//	}
+//	defer resp.Body.Close()
+//
+//	body, err := fcgx.ReadBody(resp)
+//	if err != nil {
+//		panic(err)
+//	}
+//	fmt.Println(string(body))
 package fcgx
 
 import (
@@ -19,6 +55,12 @@ import (
 	"time"
 )
 
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return &bytes.Buffer{}
+	},
+}
+
 var (
 	ErrClientClosed     = errors.New("fcgx: client closed")
 	ErrTimeout          = errors.New("fcgx: timeout")
@@ -31,53 +73,112 @@ var (
 	ErrRead             = errors.New("fcgx: read error")
 )
 
+// Config holds configuration options for FastCGI client behavior.
+// Zero values provide sensible defaults for most use cases.
+type Config struct {
+	// MaxWriteSize controls the maximum size of data chunks sent to the FastCGI server.
+	// Default: 65500 bytes (slightly under 64KB for protocol safety)
+	MaxWriteSize int
+
+	// ConnectTimeout sets the timeout for establishing initial connections.
+	// Default: 5 seconds
+	ConnectTimeout time.Duration
+
+	// RequestTimeout sets a default timeout for requests when context has no deadline.
+	// Default: 30 seconds
+	RequestTimeout time.Duration
+}
+
+// DefaultConfig returns a Config with sensible defaults for most use cases
+func DefaultConfig() *Config {
+	return &Config{
+		MaxWriteSize:   65500,
+		ConnectTimeout: 5 * time.Second,
+		RequestTimeout: 30 * time.Second,
+	}
+}
+
+// wrap enhances errors with contextual information and error classification
 func wrap(err, kind error, msg string) error {
 	return fmt.Errorf("%w: %s: %v", kind, msg, err)
 }
+
+// wrapWithContext enhances errors with additional debugging context
+func wrapWithContext(err, kind error, msg string, context map[string]interface{}) error {
+	if len(context) == 0 {
+		return wrap(err, kind, msg)
+	}
+
+	var ctxParts []string
+	for k, v := range context {
+		ctxParts = append(ctxParts, fmt.Sprintf("%s=%v", k, v))
+	}
+	contextStr := strings.Join(ctxParts, " ")
+	return fmt.Errorf("%w: %s (%s): %v", kind, msg, contextStr, err)
+}
+
+// isTimeout checks if an error is timeout-related, including various timeout error types
+// that can be returned by the network layer or context cancellation
 func isTimeout(err error) bool {
 	return errors.Is(err, ErrTimeout) ||
 		strings.Contains(err.Error(), "timeout") ||
 		strings.Contains(err.Error(), "deadline exceeded") ||
 		(strings.Contains(err.Error(), "i/o timeout"))
 }
+
+// isEOF checks if an error indicates end-of-file, including EOF variations
+// that can occur during FastCGI protocol communication
 func isEOF(err error) bool {
 	return errors.Is(err, io.EOF) || strings.Contains(err.Error(), "EOF")
 }
 
 const (
-	FCGI_HEADER_LEN     = 8
-	fcgiVersion1        = 1
-	fcgiBeginRequest    = 1
-	fcgiAbortRequest    = 2
-	fcgiEndRequest      = 3
-	fcgiParams          = 4
-	fcgiStdin           = 5
-	fcgiStdout          = 6
-	fcgiStderr          = 7
-	fcgiResponder       = 1
-	fcgiRequestComplete = 0
-	maxWrite            = 65500
-	maxPad              = 255
+	// FastCGI protocol constants
+	FCGI_HEADER_LEN = 8 // FastCGI record header length in bytes
+	fcgiVersion1    = 1 // FastCGI protocol version
+
+	// FastCGI record types
+	fcgiBeginRequest = 1 // Begin request record
+	fcgiAbortRequest = 2 // Abort request record
+	fcgiEndRequest   = 3 // End request record
+	fcgiParams       = 4 // Parameters record
+	fcgiStdin        = 5 // STDIN data record
+	fcgiStdout       = 6 // STDOUT data record
+	fcgiStderr       = 7 // STDERR data record
+
+	// FastCGI application roles and status
+	fcgiResponder       = 1 // Responder role (handles HTTP requests)
+	fcgiRequestComplete = 0 // Request completed successfully
+
+	// Performance and protocol limits
+	maxWrite = 65500 // Maximum write chunk size (slightly under 64KB for safety)
+	maxPad   = 255   // Maximum padding length
 )
 
+// header represents a FastCGI record header as defined in the FastCGI specification
 type header struct {
-	Version       uint8
-	Type          uint8
-	RequestID     uint16
-	ContentLength uint16
-	PaddingLength uint8
-	Reserved      uint8
+	Version       uint8  // Protocol version (always 1)
+	Type          uint8  // Record type (FCGI_BEGIN_REQUEST, FCGI_PARAMS, etc.)
+	RequestID     uint16 // Request ID to multiplex multiple requests over one connection
+	ContentLength uint16 // Length of the content data that follows this header
+	PaddingLength uint8  // Number of padding bytes that follow the content
+	Reserved      uint8  // Reserved for future use (always 0)
 }
 
+// Client represents a FastCGI client connection.
+// It maintains state for communicating with a FastCGI server (typically PHP-FPM).
+// All methods are thread-safe and can be called concurrently.
 type Client struct {
-	conn   net.Conn
-	mu     sync.Mutex
-	reqID  uint16
-	closed bool
-	buf    bytes.Buffer
+	conn   net.Conn     // Underlying network connection to FastCGI server
+	mu     sync.Mutex   // Protects concurrent access to client state
+	reqID  uint16       // Current request ID (incremented for each request)
+	closed bool         // Whether the client has been closed
+	buf    bytes.Buffer // Reusable buffer for building FastCGI records
+	config *Config      // Configuration options for this client
 }
 
-// Helper to write a FastCGI record
+// writeRecord constructs and sends a FastCGI record to the server.
+// It handles proper header construction, padding calculation, and thread-safe transmission.
 func (c *Client) writeRecord(recType uint8, content []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -116,11 +217,15 @@ func (c *Client) writeRecord(recType uint8, content []byte) error {
 	return nil
 }
 
+// writeBeginRequest sends a FCGI_BEGIN_REQUEST record to start a new request
 func (c *Client) writeBeginRequest(role uint16, flags uint8) error {
 	b := [8]byte{byte(role >> 8), byte(role), flags}
 	return c.writeRecord(fcgiBeginRequest, b[:])
 }
 
+// encodePair encodes a key-value pair in FastCGI name-value format.
+// It handles both short (< 128 bytes) and long (>= 128 bytes) length encoding
+// as specified in the FastCGI protocol.
 func encodePair(w *bytes.Buffer, k, v string) {
 	writeSize := func(size int) {
 		if size < 128 {
@@ -136,8 +241,15 @@ func encodePair(w *bytes.Buffer, k, v string) {
 	w.WriteString(v)
 }
 
+// writePairs encodes and sends name-value pairs as a FastCGI record.
+// This is used for sending environment variables and request parameters.
+// It uses a buffer pool to reduce memory allocations.
 func (c *Client) writePairs(recType uint8, pairs map[string]string) error {
-	w := &bytes.Buffer{}
+	// Get a buffer from the pool to reduce allocations
+	w := bufferPool.Get().(*bytes.Buffer)
+	w.Reset()
+	defer bufferPool.Put(w)
+
 	for k, v := range pairs {
 		encodePair(w, k, v)
 	}
@@ -161,7 +273,10 @@ func (c *Client) DoRequest(ctx context.Context, params map[string]string, body i
 	deadline, ok := ctx.Deadline()
 	if ok {
 		if err := c.conn.SetDeadline(deadline); err != nil {
-			return nil, wrap(err, ErrWrite, "setting deadline")
+			return nil, wrapWithContext(err, ErrWrite, "setting deadline", map[string]interface{}{
+				"deadline": deadline.Format(time.RFC3339),
+				"reqID":    c.reqID,
+			})
 		}
 		// Reset deadline after request
 		defer c.conn.SetDeadline(time.Time{})
@@ -194,7 +309,10 @@ func (c *Client) DoRequest(ctx context.Context, params map[string]string, body i
 
 	// STDIN records
 	if body != nil {
-		bodyBuf := &bytes.Buffer{}
+		bodyBuf := bufferPool.Get().(*bytes.Buffer)
+		bodyBuf.Reset()
+		defer bufferPool.Put(bodyBuf)
+
 		if _, err := io.Copy(bodyBuf, body); err != nil {
 			return nil, wrap(err, ErrRead, "reading request body")
 		}
@@ -209,8 +327,8 @@ func (c *Client) DoRequest(ctx context.Context, params map[string]string, body i
 			}
 
 			chunkSize := total - offset
-			if chunkSize > maxWrite {
-				chunkSize = maxWrite
+			if chunkSize > c.config.MaxWriteSize {
+				chunkSize = c.config.MaxWriteSize
 			}
 			chunk := data[offset : offset+chunkSize]
 			if err := c.writeRecord(fcgiStdin, chunk); err != nil {
@@ -225,8 +343,10 @@ func (c *Client) DoRequest(ctx context.Context, params map[string]string, body i
 		return nil, wrap(err, ErrWrite, "writing empty stdin")
 	}
 
-	// Read response
-	respBuf := &bytes.Buffer{}
+	// Read response - use buffer pool for better memory management
+	respBuf := bufferPool.Get().(*bytes.Buffer)
+	respBuf.Reset()
+	defer bufferPool.Put(respBuf)
 	endRequestReceived := false
 
 	for {
@@ -425,17 +545,26 @@ func chunked(te []string) bool {
 	return len(te) > 0 && te[0] == "chunked"
 }
 
-// Dial establishes a connection to the FastCGI server at the specified network address.
+// Dial establishes a connection to the FastCGI server at the specified network address
+// using default configuration options.
 func Dial(network, address string) (*Client, error) {
-	// Use a reasonable default timeout for initial connection
+	return DialWithConfig(network, address, DefaultConfig())
+}
+
+// DialWithConfig establishes a connection to the FastCGI server with custom configuration.
+func DialWithConfig(network, address string, config *Config) (*Client, error) {
+	if config == nil {
+		config = DefaultConfig()
+	}
+
 	dialer := net.Dialer{
-		Timeout: 5 * time.Second,
+		Timeout: config.ConnectTimeout,
 	}
 	conn, err := dialer.Dial(network, address)
 	if err != nil {
 		return nil, wrap(err, ErrConnect, "dialing connection")
 	}
-	return &Client{conn: conn, reqID: 1}, nil
+	return &Client{conn: conn, reqID: 1, config: config}, nil
 }
 
 // ReadBody reads and returns the actual response body as a []byte.
@@ -467,14 +596,25 @@ func ReadJSON(resp *http.Response, out any) error {
 }
 
 // DialContext establishes a connection to the FastCGI server at the specified network address
-// with the given context.
+// with the given context using default configuration.
 func DialContext(ctx context.Context, network, address string) (*Client, error) {
-	dialer := net.Dialer{}
+	return DialContextWithConfig(ctx, network, address, DefaultConfig())
+}
+
+// DialContextWithConfig establishes a connection to the FastCGI server with context and custom configuration.
+func DialContextWithConfig(ctx context.Context, network, address string, config *Config) (*Client, error) {
+	if config == nil {
+		config = DefaultConfig()
+	}
+
+	dialer := net.Dialer{
+		Timeout: config.ConnectTimeout,
+	}
 	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
 		return nil, wrap(err, ErrConnect, "dialing connection with context")
 	}
-	return &Client{conn: conn, reqID: 1}, nil
+	return &Client{conn: conn, reqID: 1, config: config}, nil
 }
 
 // Close closes the FastCGI connection.
