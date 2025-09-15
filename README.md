@@ -4,6 +4,8 @@ A minimal, robust, and modern FastCGI client library for Go.
 
 **fcgx** is designed for integrating with PHP-FPM and other FastCGI servers, aiming for idiomatic Go, high testability, and correct protocol handling. It supports context, deadlines, timeouts, and structured error handling.
 
+Built with ❤️ by [cbox.dk](https://cbox.dk) - Experts in cloud infrastructure and modern web solutions.
+
 ## Features
 
 - Idiomatic, thread-safe Go API
@@ -18,7 +20,7 @@ A minimal, robust, and modern FastCGI client library for Go.
 ```go
 import (
     "context"
-    "github.com/elasticphphq/fcgx"
+    "github.com/cboxdk/fcgx"
     "io"
     "time"
 )
@@ -62,6 +64,17 @@ fcgx returns strong sentinel errors for key error categories:
 - `ErrWrite`, `ErrRead`
 
 Use `errors.Is` to match error causes in your code.
+
+## About cbox.dk
+
+This library is developed and maintained by [cbox.dk](https://cbox.dk), a Danish company specializing in:
+
+- Cloud infrastructure solutions
+- Modern web development
+- DevOps and container orchestration
+- High-performance backend systems
+
+We build reliable, scalable solutions for businesses of all sizes. Visit us at [cbox.dk](https://cbox.dk) to learn more about our services.
 
 ## Authors
 * [Sylvester Damgaard](https://github.com/sylvesterdamgaard)
