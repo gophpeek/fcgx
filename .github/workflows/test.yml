@@ -52,6 +52,9 @@ jobs:
         volumes:
           - ${{ github.workspace }}/testing/php:/var/www/html
     steps:
+      - name: Clean up Docker artifacts
+        run: sudo rm -rf testing/php || true
+
       - uses: actions/checkout@v4
 
       - name: Set up Go
