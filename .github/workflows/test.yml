@@ -62,45 +62,6 @@ jobs:
         with:
           go-version: '1.23'
 
-      - name: Create test PHP files
-        run: |
-          mkdir -p testing/php
-          cat > testing/php/get.php << 'EOF'
-          <?php
-          header("Content-Type: text/plain");
-          echo "-PASSED-";
-          EOF
-
-          cat > testing/php/post.php << 'EOF'
-          <?php
-          header("Content-Type: text/plain");
-          foreach ($_POST as $key => $value) {
-              if (md5($value) === $key) {
-                  echo "-PASSED-";
-                  exit;
-              }
-          }
-          echo "-FAILED-";
-          EOF
-
-          cat > testing/php/json.php << 'EOF'
-          <?php
-          header("Content-Type: application/json");
-          echo json_encode(["status" => "ok", "pass" => true]);
-          EOF
-
-          cat > testing/php/malformed_json.php << 'EOF'
-          <?php
-          header("Content-Type: application/json");
-          echo "{invalid json}";
-          EOF
-
-          cat > testing/php/slow.php << 'EOF'
-          <?php
-          sleep(2);
-          echo "slow response";
-          EOF
-
       - name: Wait for PHP-FPM
         run: |
           timeout 30 bash -c 'until nc -z localhost 9000; do sleep 1; done'
